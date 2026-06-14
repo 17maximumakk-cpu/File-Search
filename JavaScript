@@ -1,0 +1,229 @@
+<!-- search.html - Поиск файлов на JavaScript (браузерная версия с File System Access API) -->
+<!-- Требуется современный браузер с поддержкой File System Access API (Chrome 86+, Edge) -->
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔍 Поиск файлов · JavaScript</title>
+    <style>
+        * { box-sizing: border-box; font-family: 'Segoe UI', system-ui; }
+        body { background: #f4f7fb; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.1); overflow: hidden; }
+        .header { background: #2c3e50; color: white; padding: 20px 30px; }
+        .controls { padding: 20px; background: #f8f9fa; border-bottom: 1px solid #e0e0e0; display: flex; flex-wrap: wrap; gap: 15px; align-items: flex-end; }
+        .control-group { display: flex; flex-direction: column; gap: 5px; }
+        .control-group label { font-size: 12px; font-weight: bold; color: #555; }
+        input, select, button { padding: 8px 12px; border-radius: 8px; border: 1px solid #ccc; }
+        button { background: #3498db; color: white; border: none; cursor: pointer; transition: 0.2s; }
+        button:hover { background: #2980b9; }
+        button:disabled { background: #95a5a6; cursor: not-allowed; }
+        .progress-bar { width: 100%; height: 6px; background: #ecf0f1; border-radius: 3px; overflow: hidden; margin: 10px 0; }
+        .progress-fill { width: 0%; height: 100%; background: #2ecc71; transition: width 0.2s; }
+        .results { padding: 20px; max-height: 60vh; overflow-y: auto; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 10px; border-bottom: 1px solid #eee; }
+        th { background: #f1f1f1; position: sticky; top: 0; }
+        tr:hover { background: #f9f9f9; cursor: pointer; }
+        .status { padding: 10px 20px; background: #ecf0f1; font-size: 12px; }
+        .filters { display: flex; flex-wrap: wrap; gap: 15px; margin-top: 10px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h2>🔍 Поиск файлов (File System Access API)</h2>
+        <p style="margin-top: 5px; font-size: 12px; opacity: 0.8;">Выберите папку для поиска</p>
+    </div>
+    <div class="controls">
+        <div class="control-group">
+            <label>📁 Корневая папка</label>
+            <button id="selectFolderBtn">Выбрать папку</button>
+            <span id="folderPath" style="font-size:12px; color:#666;">(не выбрана)</span>
+        </div>
+        <div class="control-group">
+            <label>🔤 Имя файла (маска)</label>
+            <input type="text" id="namePattern" value="*" placeholder="*.txt, file?.*">
+        </div>
+        <div class="control-group">
+            <label>📄 Расширения (через запятую)</label>
+            <input type="text" id="extensions" placeholder="txt,js,py">
+        </div>
+        <div class="control-group">
+            <label>🔎 Поиск в содержимом</label>
+            <input type="text" id="contentSearch" placeholder="текст для поиска">
+        </div>
+        <button id="searchBtn">🔍 Найти</button>
+        <button id="stopBtn" disabled>⏹️ Остановить</button>
+        <button id="exportBtn" disabled>💾 Экспорт CSV</button>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="results">
+        <table id="resultsTable">
+            <thead><tr><th>Имя</th><th>Путь (относительный)</th><th>Размер (байт)</th><th>Изменён</th></tr></thead>
+            <tbody id="resultsBody"></tbody>
+        </table>
+    </div>
+    <div class="status" id="status">Готов</div>
+</div>
+<script>
+    let directoryHandle = null;
+    let abortController = null;
+    let results = [];
+
+    const selectFolderBtn = document.getElementById('selectFolderBtn');
+    const folderPathSpan = document.getElementById('folderPath');
+    const searchBtn = document.getElementById('searchBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const exportBtn = document.getElementById('exportBtn');
+    const namePatternInput = document.getElementById('namePattern');
+    const extensionsInput = document.getElementById('extensions');
+    const contentSearchInput = document.getElementById('contentSearch');
+    const resultsBody = document.getElementById('resultsBody');
+    const progressFill = document.getElementById('progressFill');
+    const statusSpan = document.getElementById('status');
+
+    selectFolderBtn.onclick = async () => {
+        try {
+            directoryHandle = await window.showDirectoryPicker();
+            folderPathSpan.textContent = directoryHandle.name;
+        } catch (err) {
+            console.log('Отменено или ошибка');
+        }
+    };
+
+    function matchesPattern(filename, pattern) {
+        if (pattern === '*') return true;
+        const regexPattern = pattern.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.');
+        return new RegExp(`^${regexPattern}$`, 'i').test(filename);
+    }
+
+    function matchesExtensions(filename, extList) {
+        if (!extList.length) return true;
+        const ext = filename.split('.').pop().toLowerCase();
+        return extList.includes(ext);
+    }
+
+    async function searchInFile(file, searchText) {
+        if (!searchText) return true;
+        try {
+            const text = await file.text();
+            return text.toLowerCase().includes(searchText.toLowerCase());
+        } catch {
+            return false;
+        }
+    }
+
+    async function walkDirectory(dirHandle, relativePath, pattern, extensions, contentSearch, abortSignal) {
+        const entries = [];
+        for await (const entry of dirHandle.values()) {
+            if (abortSignal.aborted) throw new Error('stopped');
+            const path = relativePath ? `${relativePath}/${entry.name}` : entry.name;
+            if (entry.kind === 'directory') {
+                // пропускаем скрытые папки
+                if (!entry.name.startsWith('.')) {
+                    await walkDirectory(entry, path, pattern, extensions, contentSearch, abortSignal);
+                }
+            } else {
+                // файл
+                if (matchesPattern(entry.name, pattern) && matchesExtensions(entry.name, extensions)) {
+                    const file = await entry.getFile();
+                    const matchesContent = await searchInFile(file, contentSearch);
+                    if (matchesContent) {
+                        results.push({
+                            name: entry.name,
+                            path: path,
+                            size: file.size,
+                            modified: file.lastModifiedDate ? file.lastModifiedDate.toLocaleString() : new Date(file.lastModified).toLocaleString()
+                        });
+                        // обновляем таблицу постепенно (каждые 10 файлов)
+                        if (results.length % 10 === 0) {
+                            updateTable();
+                            updateProgress();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    function updateTable() {
+        resultsBody.innerHTML = '';
+        for (const r of results) {
+            const row = resultsBody.insertRow();
+            row.insertCell(0).textContent = r.name;
+            row.insertCell(1).textContent = r.path;
+            row.insertCell(2).textContent = r.size;
+            row.insertCell(3).textContent = r.modified;
+            row.addEventListener('click', () => alert(`Путь: ${r.path}`)); // упрощённо
+        }
+        statusSpan.textContent = `Найдено: ${results.length}`;
+    }
+
+    function updateProgress() {
+        // для прогресса нужен общий подсчёт — здесь нереально, просто индикация активности
+        progressFill.style.width = `${Math.min(100, results.length / 10)}%`;
+    }
+
+    async function startSearch() {
+        if (!directoryHandle) {
+            alert('Выберите папку');
+            return;
+        }
+        abortController = new AbortController();
+        results = [];
+        updateTable();
+        searchBtn.disabled = true;
+        stopBtn.disabled = false;
+        exportBtn.disabled = true;
+        statusSpan.textContent = 'Поиск...';
+        progressFill.style.width = '0%';
+        try {
+            const pattern = namePatternInput.value.trim() || '*';
+            const extStr = extensionsInput.value.trim();
+            const extensions = extStr ? extStr.split(',').map(e => e.trim().toLowerCase()) : [];
+            const contentSearch = contentSearchInput.value.trim();
+            await walkDirectory(directoryHandle, '', pattern, extensions, contentSearch, abortController.signal);
+            statusSpan.textContent = `Готово. Найдено ${results.length} файлов.`;
+            exportBtn.disabled = false;
+        } catch (err) {
+            if (err.message !== 'stopped') {
+                console.error(err);
+                statusSpan.textContent = `Ошибка: ${err.message}`;
+            } else {
+                statusSpan.textContent = 'Поиск остановлен';
+            }
+        } finally {
+            searchBtn.disabled = false;
+            stopBtn.disabled = true;
+            progressFill.style.width = '100%';
+        }
+    }
+
+    function stopSearch() {
+        if (abortController) {
+            abortController.abort();
+            abortController = null;
+        }
+    }
+
+    function exportCSV() {
+        if (!results.length) return;
+        let csv = "Имя,Путь,Размер (байт),Дата изменения\n";
+        for (const r of results) {
+            csv += `"${r.name}","${r.path}",${r.size},"${r.modified}"\n`;
+        }
+        const blob = new Blob([csv], {type: 'text/csv'});
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'search_results.csv';
+        a.click();
+        URL.revokeObjectURL(a.href);
+    }
+
+    searchBtn.onclick = startSearch;
+    stopBtn.onclick = stopSearch;
+    exportBtn.onclick = exportCSV;
+</script>
+</body>
+</html>
