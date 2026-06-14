@@ -1,0 +1,163 @@
+// search.go - Поиск файлов на Go (CLI с цветным выводом и многопоточностью)
+package main
+
+import (
+	"bufio"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+)
+
+type FileInfo struct {
+	Path    string
+	Name    string
+	Size    int64
+	ModTime time.Time
+}
+
+var (
+	pattern   string
+	extensions string
+	searchText string
+	minSize   int64
+	maxSize   int64
+	workers   int
+)
+
+func main() {
+	root := flag.String("path", ".", "Корневая папка для поиска")
+	flag.StringVar(&pattern, "name", "*", "Маска имени файла (например *.txt)")
+	flag.StringVar(&extensions, "ext", "", "Расширения через запятую (txt,go,py)")
+	flag.StringVar(&searchText, "content", "", "Искать текст внутри файлов")
+	flag.Int64Var(&minSize, "min-size", 0, "Минимальный размер в байтах")
+	flag.Int64Var(&maxSize, "max-size", 0, "Максимальный размер в байтах")
+	flag.IntVar(&workers, "workers", 4, "Количество воркеров")
+	flag.Parse()
+
+	if *root == "" {
+		fmt.Println("Укажите путь к папке")
+		return
+	}
+
+	results := make(chan FileInfo, 100)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var allResults []FileInfo
+
+	// Преобразуем маску в регулярку
+	regexPattern := strings.ReplaceAll(regexp.QuoteMeta(pattern), `\*`, `.*`)
+	regexPattern = strings.ReplaceAll(regexPattern, `\?`, `.`)
+	nameRegex, err := regexp.Compile("(?i)" + regexPattern)
+	if err != nil {
+		fmt.Println("Ошибка маски:", err)
+		return
+	}
+
+	extList := []string{}
+	if extensions != "" {
+		for _, ext := range strings.Split(extensions, ",") {
+			extList = append(extList, strings.TrimSpace(strings.ToLower(ext)))
+		}
+	}
+
+	// Очередь для walk
+	fileQueue := make(chan string, 1000)
+	// Запускаем воркеров для обработки файлов
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for filePath := range fileQueue {
+				info, err := os.Stat(filePath)
+				if err != nil {
+					continue
+				}
+				if info.IsDir() {
+					continue
+				}
+				name := info.Name()
+				// Фильтр по имени
+				if !nameRegex.MatchString(name) {
+					continue
+				}
+				// Фильтр по расширению
+				if len(extList) > 0 {
+					ext := strings.ToLower(filepath.Ext(name))
+					if len(ext) > 0 && ext[0] == '.' {
+						ext = ext[1:]
+					}
+					found := false
+					for _, e := range extList {
+						if e == ext {
+							found = true
+							break
+						}
+					}
+					if !found {
+						continue
+					}
+				}
+				// Фильтр по размеру
+				size := info.Size()
+				if minSize > 0 && size < minSize {
+					continue
+				}
+				if maxSize > 0 && size > maxSize {
+					continue
+				}
+				// Поиск в содержимом
+				if searchText != "" {
+					content, err := os.ReadFile(filePath)
+					if err != nil {
+						continue
+					}
+					if !strings.Contains(strings.ToLower(string(content)), strings.ToLower(searchText)) {
+						continue
+					}
+				}
+				results <- FileInfo{
+					Path:    filePath,
+					Name:    name,
+					Size:    size,
+					ModTime: info.ModTime(),
+				}
+			}
+		}()
+	}
+
+	// Запускаем обход папок
+	go func() {
+		err := filepath.Walk(*root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			// Пропускаем скрытые папки
+			if info.IsDir() && strings.HasPrefix(info.Name(), ".") {
+				return filepath.SkipDir
+			}
+			if !info.IsDir() {
+				fileQueue <- path
+			}
+			return nil
+		})
+		if err != nil {
+			fmt.Println("Ошибка обхода:", err)
+		}
+		close(fileQueue)
+		wg.Wait()
+		close(results)
+	}()
+
+	// Сбор результатов
+	for res := range results {
+		allResults = append(allResults, res)
+		// Цветной вывод
+		fmt.Printf("\033[32m%s\033[0m (%d байт, %s)\n", res.Path, res.Size, res.ModTime.Format("2006-01-02 15:04:05"))
+	}
+	fmt.Printf("\n✅ Найдено файлов: %d\n", len(allResults))
+}
