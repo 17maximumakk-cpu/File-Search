@@ -1,0 +1,128 @@
+// search.rs - Поиск файлов на Rust (асинхронный, с фильтрацией)
+// Зависимости в Cargo.toml:
+// [dependencies]
+// walkdir = "2"
+// regex = "1"
+// ignore = "0.4"
+// rayon = "1.5"
+// colored = "2.0"
+// clap = { version = "4", features = ["derive"] }
+
+use clap::Parser;
+use walkdir::WalkDir;
+use regex::Regex;
+use colored::*;
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+use rayon::prelude::*;
+use ignore::WalkBuilder;
+
+#[derive(Parser)]
+#[command(name = "search", about = "Поиск файлов")]
+struct Args {
+    #[arg(help = "Корневая папка")]
+    path: String,
+    
+    #[arg(short, long, default_value = "*")]
+    name: String,
+    
+    #[arg(short, long, help = "Расширения через запятую")]
+    ext: Option<String>,
+    
+    #[arg(short, long, help = "Текст для поиска внутри файлов")]
+    content: Option<String>,
+    
+    #[arg(long, help = "Минимальный размер (байт)")]
+    min_size: Option<u64>,
+    
+    #[arg(long, help = "Максимальный размер (байт)")]
+    max_size: Option<u64>,
+    
+    #[arg(short, long, default_value = "4")]
+    threads: usize,
+}
+
+fn main() {
+    let args = Args::parse();
+    
+    // Преобразование маски в регулярное выражение
+    let name_pattern = regex::escape(&args.name).replace("\\*", ".*").replace("\\?", ".");
+    let name_regex = Regex::new(&format!("(?i)^{}$", name_pattern)).unwrap();
+    
+    let ext_list: Vec<String> = args.ext
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    
+    let search_text = args.content.clone();
+    let min_size = args.min_size;
+    let max_size = args.max_size;
+    
+    let walker = WalkBuilder::new(&args.path)
+        .follow_links(false)
+        .hidden(false)
+        .git_ignore(false)
+        .build();
+    
+    let files: Vec<_> = walker
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .collect();
+    
+    let results: Vec<_> = files
+        .par_iter()
+        .with_min_len(10)
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            if !name_regex.is_match(&name) {
+                return false;
+            }
+            // Расширение
+            if !ext_list.is_empty() {
+                let ext = Path::new(&*name).extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_lowercase())
+                    .unwrap_or_default();
+                if !ext_list.contains(&ext) {
+                    return false;
+                }
+            }
+            // Размер
+            if let Ok(metadata) = entry.metadata() {
+                let size = metadata.len();
+                if let Some(min) = min_size {
+                    if size < min { return false; }
+                }
+                if let Some(max) = max_size {
+                    if size > max { return false; }
+                }
+                // Поиск в содержимом
+                if let Some(ref text) = search_text {
+                    if let Ok(content) = fs::read_to_string(entry.path()) {
+                        if !content.to_lowercase().contains(&text.to_lowercase()) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        })
+        .map(|entry| {
+            let meta = entry.metadata().unwrap();
+            (entry.path().to_path_buf(), meta.len(), meta.modified().unwrap())
+        })
+        .collect();
+    
+    for (path, size, modified) in &results {
+        println!("{} ({} bytes, {:?})", path.display().to_string().green(), size, modified);
+    }
+    println!("\n✅ Найдено файлов: {}", results.len());
+}
